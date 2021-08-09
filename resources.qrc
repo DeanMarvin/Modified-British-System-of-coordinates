@@ -1,5 +1,0 @@
-<RCC>
-    <qresource prefix="/plugins/ndg_converter" >
-        <file>icon.png</file>
-    </qresource>
-</RCC>
