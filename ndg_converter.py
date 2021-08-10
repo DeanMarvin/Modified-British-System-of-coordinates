@@ -21,14 +21,20 @@
  *                                                                         *
  ***************************************************************************/
 """
-from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication
-from qgis.PyQt.QtGui import QIcon
+from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, QSizeF, QPoint
+from qgis.PyQt.QtGui import QIcon, QTextDocument, QColor
 from qgis.PyQt.QtWidgets import QAction, QLineEdit
+
+from qgis.core import QgsProject, Qgis, QgsTextAnnotation, QgsAnnotationManager, QgsCoordinateReferenceSystem, \
+    QgsPointXY, QgsSimpleMarkerSymbolLayer, QgsMarkerSymbol, QgsTextFormat
+
+from pyproj import transform, Proj
+import pyproj
 
 # Initialize Qt resources from file resources.py
 from .resources import *
 # Import the code for the dialog
-from .ndg_converter_dialog import MbsTransformDialog
+from .showxydialog import showXYDialog
 import os.path
 
 
@@ -81,7 +87,6 @@ class MbsTransform:
         """
         # noinspection PyTypeChecker,PyArgumentList,PyCallByClass
         return QCoreApplication.translate('MbsTransform', message)
-
 
     def add_action(
         self,
@@ -146,7 +151,8 @@ class MbsTransform:
 
         if add_to_toolbar:
             # Adds plugin icon to Plugins toolbar
-            self.iface.addToolBarIcon(action)
+            pass
+            # self.iface.addToolBarIcon(action)
 
         if add_to_menu:
             self.iface.addPluginToMenu(
@@ -160,7 +166,7 @@ class MbsTransform:
     def initGui(self):
         """Create the menu entries and toolbar icons inside the QGIS GUI."""
 
-        icon_path = ':/plugins/ndg_converter/icon.png'
+        icon_path = ':/plugins/Modified-British-System-of-coordinates/show_marker.png'
         self.add_action(
             icon_path,
             text=self.tr(u'NDG Converter'),
@@ -177,6 +183,7 @@ class MbsTransform:
             "add NDG-Coordinate to map",
             self.iface.mainWindow()
         )
+        self.actionAddLayer.triggered.connect(self.show_coordinates)
 
         # Create action to remove Layer from Canvas
         self.actionRemoveLayer = QAction(
@@ -184,6 +191,7 @@ class MbsTransform:
             "clear map",
             self.iface.mainWindow()
         )
+        self.actionRemoveLayer.triggered.connect(self.clear_annotation)
 
         # Create action to show XY-Coordinates
         self.actionShowXY = QAction(
@@ -191,6 +199,7 @@ class MbsTransform:
             "show XY-Coordinates in Window",
             self.iface.mainWindow()
         )
+        self.actionShowXY.triggered.connect(self.show_coordinates)
 
         # Create toolbar for this plugin
         self.toolbar = self.iface.addToolBar("NDG Converter")
@@ -199,34 +208,193 @@ class MbsTransform:
         self.toolbar.addAction(self.actionRemoveLayer)
         self.toolbar.addAction(self.actionShowXY)
 
-        # will be set False in run()
-        self.first_start = True
-
+        self.dialogShowXY = showXYDialog()
 
     def unload(self):
         """Removes the plugin menu item and icon from QGIS GUI."""
+
         for action in self.actions:
             self.iface.removePluginMenu(
                 self.tr(u'&NDG Converter'),
                 action)
             self.iface.removeToolBarIcon(action)
 
+    @staticmethod
+    def project():
+        """Return QGSProject"""
+
+        return QgsProject.instance()
+
+    @staticmethod
+    def crs_modified_lambert():
+        """define the spatial reference of the Modified British System coordinate"""
+
+        crs_modified_lambert = Proj(
+            '+proj=lcc +lat_0=49.5 +lon_0=7.737208 +lat_1=49.5 +lat_2=49.5 +x_0=600000 +y_0=300000 +k_0=0.99950908 +a=6376523 +rf=308.64 +units=m +no_defs +type=crs')
+
+        return crs_modified_lambert
+
+    def output_spatial_reference_system(self):
+        """Return the output spatial reference system from current project crs"""
+
+        project_crs = str(self.project().crs())[31:-1]
+        return project_crs
+
+    def check_mbs_coordinate(self, input_coordinate):
+        """check validation of input-coordinate"""
+
+        try:
+            failures = []
+
+            if len(input_coordinate) % 2 != 0:
+                failures.append('Ungerade Anzahl an Koordinaten-Stellen.')
+            if input_coordinate[0].islower() is False:
+                failures.append('Erste Koordinaten-Stelle muss ein Kleinbuchstabe sein.')
+            elif input_coordinate[0] not in ['v', 'w', 'x', 'q', 'r', 's', 'n']:
+                failures.append('Erste Stelle außerhalb des gültigen Bereichs (n, q, r, s, v, w, x).')
+            if input_coordinate[1].isupper() is False:
+                failures.append('Zweite Koordinaten-Stelle muss ein Großbuchstabe sein.')
+            elif input_coordinate[1] not in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'J', 'K', 'L', 'M', 'N', 'O', 'P',
+                                             'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z']:
+                failures.append('Zweite Stelle außerhalb des gültigen Bereichs (A, B, C, D, E, F, G, H, J, K, L, M, '
+                                'N, O, P, Q, R, S, T, U, V, W, X, Y, Z.')
+            if any(char.isalpha() for char in input_coordinate[2:]) is True:
+                failures.append('Die Koordinate enthält mehr als zwei Buchstaben.')
+
+            return failures
+
+        except IndexError:
+            self.iface.messageBar().pushMessage("Error", "Gültige Koordinate eingeben.", level=Qgis.Critical,
+                                                duration=5)
+
+    @staticmethod
+    def mbs_to_crs(in_coordinate, crs_modified_lambert, crs_specified):
+        """Convert mbs to specified crs coordinates"""
+        try:
+            # split Coordinate to according to Modified British System
+            km500_square = in_coordinate[0]
+            km100_square = in_coordinate[1]
+            detailed_square = in_coordinate[2:]
+
+            # define Squares in m from origin according to Modified British System
+            # pay attention to the special order of line, ABCDE is the bottom row
+            km500_square_dict = {'v': [0, 0], 'w': [500000, 0], 'x': [1000000, 0],
+                                 'q': [0, 500000], 'r': [500000, 500000], 's': [1000000, 500000],
+                                 'n': [1000000, 1000000]}
+
+            km100_square_dict = {'F': [0, 400000], 'G': [100000, 400000], 'H': [200000, 400000],
+                                 'J': [300000, 400000], 'K': [400000, 400000], 'L': [0, 300000],
+                                 'M': [100000, 300000], 'N': [200000, 300000], 'O': [300000, 300000],
+                                 'P': [400000, 300000], 'Q': [0, 200000], 'R': [100000, 200000],
+                                 'S': [200000, 200000], 'T': [300000, 200000], 'U': [400000, 200000],
+                                 'V': [0, 100000], 'W': [100000, 100000], 'X': [200000, 100000],
+                                 'Y': [300000, 100000], 'Z': [400000, 100000], 'A': [0, 0],
+                                 'B': [100000, 0], 'C': [200000, 0], 'D': [300000, 0],
+                                 'E': [400000, 0]}
+
+            # get the 500 km root of coordinate
+            lambert_x_coordinate = km500_square_dict[km500_square][0]
+            lambert_y_coordinate = km500_square_dict[km500_square][1]
+
+            # get the 100 km root of coordinate
+            lambert_x_coordinate += km100_square_dict[km100_square][0]
+            lambert_y_coordinate += km100_square_dict[km100_square][1]
+
+            # depending on the detail-level of the coordinate (4-10 digits)
+            # the digits have to match this level (1-1000 m)
+            factor = [1000, 100, 10, 1][(len(detailed_square) // 2) - 2]
+
+            # get the detailed coordinate, depending on its accuracy (see factor 1-1000 m)
+            lambert_x_coordinate = lambert_x_coordinate + int(detailed_square[:len(detailed_square) // 2]) * factor
+            lambert_y_coordinate = lambert_y_coordinate + int(detailed_square[len(detailed_square) // 2:]) * factor
+
+            # transform the MBS coordinate to WGS84
+            try:
+                x, y = transform(crs_modified_lambert, crs_specified, lambert_x_coordinate, lambert_y_coordinate)
+                return x, y
+            except pyproj.exceptions.CRSError:
+                pass
+        except IndexError:
+            pass
+
+    def clear_annotation(self):
+        """Clear QgsTextAnnotation from canvas"""
+
+        self.project().annotationManager().clear()
+
+    def set_annotation(self, name, crs, coordinates):
+        """Define settings of QgsTextAnnotation"""
+
+        self.clear_annotation()
+
+        annotation = QgsTextAnnotation()
+
+        annotation.setFrameOffsetFromReferencePoint(QPoint(1, 1))
+
+        doc = QTextDocument()
+        doc.setHtml("<p style='font-family: Yu Gothic UI; color: #FF8000; font-size: 15px;'>{}</p>".format(name))
+
+        annotation.setDocument(doc)
+
+        annotation.setMapPositionCrs(QgsCoordinateReferenceSystem(crs))
+        annotation.setMapPosition(QgsPointXY(coordinates[0], coordinates[1]))
+
+        marker = QgsMarkerSymbol.createSimple({"size": "3.0", "color": "darkRed", "color_border": "white"})
+
+        annotation.setMarkerSymbol(marker)
+
+        self.project().annotationManager().addAnnotation(annotation)
+
+        self.iface.mapCanvas().setCenter(QgsPointXY(float(coordinates[0]), float(coordinates[1])))
+
+    def show_coordinates(self):
+        """Show output coordinate as QGSTextAnnotation"""
+
+        in_coordinate = self.lineEdit.text()
+        crs_modified_lambert = self.crs_modified_lambert()
+        crs_specified = self.output_spatial_reference_system()
+
+        failures = self.check_mbs_coordinate(in_coordinate)
+
+        if failures != []:
+            self.iface.messageBar().pushMessage("Error", "Fehler bei Koordinate {}".format(in_coordinate),
+                                                level=Qgis.Critical, duration=5)
+            try:
+                for f in failures:
+                    self.iface.messageBar().pushMessage("Error", f, level=Qgis.Critical, duration=8)
+                    continue
+            except TypeError:
+                pass
+
+        else:
+            try:
+
+                converted_coordinates = self.mbs_to_crs(in_coordinate, crs_modified_lambert, crs_specified)
+
+                self.set_annotation(in_coordinate, crs_specified, converted_coordinates)
+
+                self.iface.messageBar().pushMessage("Success",
+                                                    "Transformation erfolgreich",
+                                                    level=Qgis.Success, duration=3)
+            except TypeError:
+                self.iface.messageBar().pushMessage("Error",
+                                                    " Für Koordinatentransformation bitte Zielkoordinatensystem wählen."
+                                                    , level=Qgis.Critical, duration=8)
+
+    def show_coordinates_in_window(self, x, y):
+        """Open window and show coordinates"""
+
+        self.dlg = showXYDialog()
+
+        self.dlg.lineEdit.clear()
+        self.dlg.lineEdit_2.clear()
+
+        self.dlg.lineEdit.setText(str(x))
+        self.dlg.lineEdit_2.setText(str(y))
+
+        self.dlg.show()
 
     def run(self):
         """Run method that performs all the real work"""
 
-        # Create the dialog with elements (after translation) and keep reference
-        # Only create GUI ONCE in callback, so that it will only load when the plugin is started
-        if self.first_start == True:
-            self.first_start = False
-            self.dlg = MbsTransformDialog()
-
-        # show the dialog
-        self.dlg.show()
-        # Run the dialog event loop
-        result = self.dlg.exec_()
-        # See if OK was pressed
-        if result:
-            # Do something useful here - delete the line containing pass and
-            # substitute with your code.
-            pass
+        pass
