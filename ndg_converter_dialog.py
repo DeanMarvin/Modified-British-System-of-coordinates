@@ -22,12 +22,10 @@
  ***************************************************************************/
 """
 
-import os
-
-from qgis.PyQt import uic
 from qgis.PyQt import QtWidgets
 
 from .ndg_converter_dialog_base import Ui_MbsTransformDialogBase
+
 
 class MbsTransformDialog(QtWidgets.QDialog, Ui_MbsTransformDialogBase):
     def __init__(self, parent=None):

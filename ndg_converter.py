@@ -21,8 +21,8 @@
  *                                                                         *
  ***************************************************************************/
 """
-from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, QSizeF, QPoint
-from qgis.PyQt.QtGui import QIcon, QTextDocument, QColor
+from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, QPoint
+from qgis.PyQt.QtGui import QIcon, QTextDocument
 from qgis.PyQt.QtWidgets import QAction, QLineEdit
 
 from qgis.core import QgsProject, Qgis, QgsTextAnnotation, QgsAnnotationManager, QgsCoordinateReferenceSystem, \
@@ -31,10 +31,8 @@ from qgis.core import QgsProject, Qgis, QgsTextAnnotation, QgsAnnotationManager,
 from pyproj import transform, Proj
 import pyproj
 
-# Initialize Qt resources from file resources.py
-from .resources import *
-# Import the code for the dialog
-from .showxydialog import showXYDialog
+from .showxydialog import ShowXYDialog
+
 import os.path
 
 
@@ -99,44 +97,6 @@ class MbsTransform:
         status_tip=None,
         whats_this=None,
         parent=None):
-        """Add a toolbar icon to the toolbar.
-
-        :param icon_path: Path to the icon for this action. Can be a resource
-            path (e.g. ':/plugins/foo/bar.png') or a normal file system path.
-        :type icon_path: str
-
-        :param text: Text that should be shown in menu items for this action.
-        :type text: str
-
-        :param callback: Function to be called when the action is triggered.
-        :type callback: function
-
-        :param enabled_flag: A flag indicating if the action should be enabled
-            by default. Defaults to True.
-        :type enabled_flag: bool
-
-        :param add_to_menu: Flag indicating whether the action should also
-            be added to the menu. Defaults to True.
-        :type add_to_menu: bool
-
-        :param add_to_toolbar: Flag indicating whether the action should also
-            be added to the toolbar. Defaults to True.
-        :type add_to_toolbar: bool
-
-        :param status_tip: Optional text to show in a popup when mouse pointer
-            hovers over the action.
-        :type status_tip: str
-
-        :param parent: Parent widget for the new action. Defaults None.
-        :type parent: QWidget
-
-        :param whats_this: Optional text to show in the status bar when the
-            mouse pointer hovers over the action.
-
-        :returns: The action that was created. Note that the action is also
-            added to self.actions list.
-        :rtype: QAction
-        """
 
         icon = QIcon(icon_path)
         action = QAction(icon, text, parent)
@@ -150,9 +110,7 @@ class MbsTransform:
             action.setWhatsThis(whats_this)
 
         if add_to_toolbar:
-            # Adds plugin icon to Plugins toolbar
             pass
-            # self.iface.addToolBarIcon(action)
 
         if add_to_menu:
             self.iface.addPluginToMenu(
@@ -183,7 +141,7 @@ class MbsTransform:
             "add NDG-Coordinate to map",
             self.iface.mainWindow()
         )
-        self.actionAddLayer.triggered.connect(self.show_coordinates)
+        self.actionAddLayer.triggered.connect(self.coordinates_in_canvas)
 
         # Create action to remove Layer from Canvas
         self.actionRemoveLayer = QAction(
@@ -199,7 +157,7 @@ class MbsTransform:
             "show XY-Coordinates in Window",
             self.iface.mainWindow()
         )
-        self.actionShowXY.triggered.connect(self.show_coordinates)
+        self.actionShowXY.triggered.connect(self.coordinates_in_window)
 
         # Create toolbar for this plugin
         self.toolbar = self.iface.addToolBar("NDG Converter")
@@ -208,7 +166,7 @@ class MbsTransform:
         self.toolbar.addAction(self.actionRemoveLayer)
         self.toolbar.addAction(self.actionShowXY)
 
-        self.dialogShowXY = showXYDialog()
+        self.dialogShowXY = ShowXYDialog()
 
     def unload(self):
         """Removes the plugin menu item and icon from QGIS GUI."""
@@ -309,13 +267,61 @@ class MbsTransform:
             lambert_y_coordinate = lambert_y_coordinate + int(detailed_square[len(detailed_square) // 2:]) * factor
 
             # transform the MBS coordinate to WGS84
-            try:
-                x, y = transform(crs_modified_lambert, crs_specified, lambert_x_coordinate, lambert_y_coordinate)
-                return x, y
-            except pyproj.exceptions.CRSError:
-                pass
-        except IndexError:
+            x, y = transform(crs_modified_lambert, crs_specified, lambert_x_coordinate, lambert_y_coordinate)
+            return x, y
+
+        except (IndexError, pyproj.exceptions.CRSError):
             pass
+
+    def coordinates_in_canvas(self):
+        """Call show coordinates function with False statement to show coordinates in canvas only"""
+        self.show_coordinates(False)
+
+    def coordinates_in_window(self):
+        """Call show coordinates function with True statement to show coordinates in window only"""
+        self.show_coordinates(True)
+
+    def show_coordinates(self, mode):
+        """Show output coordinate as QGSTextAnnotation"""
+
+        in_coordinate = self.lineEdit.text()
+        crs_modified_lambert = self.crs_modified_lambert()
+        crs_specified = self.output_spatial_reference_system()
+
+        failures = self.check_mbs_coordinate(in_coordinate)
+
+        if failures != []:
+            self.iface.messageBar().pushMessage("Error", "Fehler bei Koordinate {}".format(in_coordinate),
+                                                level=Qgis.Critical, duration=5)
+            try:
+                for f in failures:
+                    self.iface.messageBar().pushMessage("Error", f, level=Qgis.Critical, duration=8)
+                    continue
+            except TypeError:
+                pass
+
+        else:
+            try:
+
+                converted_coordinates = self.mbs_to_crs(in_coordinate, crs_modified_lambert, crs_specified)
+
+                # show in canvas
+                if mode == False:
+
+                    self.set_annotation(in_coordinate, crs_specified, converted_coordinates)
+
+                    self.iface.messageBar().pushMessage("Success",
+                                                        "Transformation erfolgreich",
+                                                        level=Qgis.Success, duration=3)
+                #show in window
+                else:
+
+                    self.show_coordinates_in_window(converted_coordinates[0], converted_coordinates[1])
+
+            except TypeError:
+                self.iface.messageBar().pushMessage("Error",
+                                                    " Für Koordinatentransformation bitte Zielkoordinatensystem wählen."
+                                                    , level=Qgis.Critical, duration=8)
 
     def clear_annotation(self):
         """Clear QgsTextAnnotation from canvas"""
@@ -347,44 +353,10 @@ class MbsTransform:
 
         self.iface.mapCanvas().setCenter(QgsPointXY(float(coordinates[0]), float(coordinates[1])))
 
-    def show_coordinates(self):
-        """Show output coordinate as QGSTextAnnotation"""
-
-        in_coordinate = self.lineEdit.text()
-        crs_modified_lambert = self.crs_modified_lambert()
-        crs_specified = self.output_spatial_reference_system()
-
-        failures = self.check_mbs_coordinate(in_coordinate)
-
-        if failures != []:
-            self.iface.messageBar().pushMessage("Error", "Fehler bei Koordinate {}".format(in_coordinate),
-                                                level=Qgis.Critical, duration=5)
-            try:
-                for f in failures:
-                    self.iface.messageBar().pushMessage("Error", f, level=Qgis.Critical, duration=8)
-                    continue
-            except TypeError:
-                pass
-
-        else:
-            try:
-
-                converted_coordinates = self.mbs_to_crs(in_coordinate, crs_modified_lambert, crs_specified)
-
-                self.set_annotation(in_coordinate, crs_specified, converted_coordinates)
-
-                self.iface.messageBar().pushMessage("Success",
-                                                    "Transformation erfolgreich",
-                                                    level=Qgis.Success, duration=3)
-            except TypeError:
-                self.iface.messageBar().pushMessage("Error",
-                                                    " Für Koordinatentransformation bitte Zielkoordinatensystem wählen."
-                                                    , level=Qgis.Critical, duration=8)
-
     def show_coordinates_in_window(self, x, y):
         """Open window and show coordinates"""
 
-        self.dlg = showXYDialog()
+        self.dlg = ShowXYDialog()
 
         self.dlg.lineEdit.clear()
         self.dlg.lineEdit_2.clear()
